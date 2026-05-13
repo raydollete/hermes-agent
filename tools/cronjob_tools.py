@@ -53,14 +53,39 @@ _CRON_SECRET_VAR_RE = r'\$\{?\w*(?:KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL|API)\w*\
 _CRON_EXFIL_COMMAND_PATTERNS = [
     # Tighten exfil detection to obvious leak paths: embedding a secret
     # directly in the destination URL, sending it in POST/FORM payloads,
-    # or shipping it via Authorization headers to arbitrary hosts. The
-    # only intended allowlist exception today is the bundled GitHub skill
-    # pattern that talks to api.github.com.
+    # or shipping it via Authorization headers to arbitrary hosts.
+    # Known-good shapes for bundled skills are exempted via
+    # ``_CRON_AUTH_HEADER_EXEMPTIONS`` before scanning.
     (rf'curl\s+[^\n]*https?://[^\s"\'`]*{_CRON_SECRET_VAR_RE}', "exfil_curl_url"),
     (rf'wget\s+[^\n]*https?://[^\s"\'`]*{_CRON_SECRET_VAR_RE}', "exfil_wget_url"),
     (rf'curl\s+[^\n]*(?:--data(?:-raw|-binary|-urlencode)?|-d|--form|-F)\s+[^\n]*{_CRON_SECRET_VAR_RE}', "exfil_curl_data"),
     (rf'wget\s+[^\n]*--post-(?:data|file)=[^\n]*{_CRON_SECRET_VAR_RE}', "exfil_wget_post"),
     (rf'curl\s+[^\n]*(?:-H|--header)\s+["\']Authorization:\s*(?:Bearer|token)\s+{_CRON_SECRET_VAR_RE}["\']', "exfil_curl_auth_header"),
+]
+
+# Host-anchored exemptions for the bundled skills' Authorization-header curl
+# shapes. Matches are stripped from the prompt copy before threat scanning,
+# so the broader exfil rules don't fire on known-good patterns. Each
+# exemption matches a whole curl invocation (including shell line
+# continuations) that simultaneously carries the auth header AND targets
+# the allowed destination — order-independent so intervening flags
+# (``-H "Content-Type: ..."``, ``--data-urlencode ...``, etc.) don't break
+# the match. Substring-style anchoring is intentional: the scanner exists
+# to catch accidental exfil shapes in user-authored cron prompts, not to
+# defend against an adversary who already controls the prompt (who has
+# trivially easier bypasses).
+_CRON_CURL_INVOCATION = r'(?:[^\n]|\\\n)*'  # body of a single curl invocation
+_CRON_AUTH_HEADER_EXEMPTIONS = [
+    # GitHub skill: PATs against api.github.com.
+    rf'curl(?={_CRON_CURL_INVOCATION}Authorization:\s*token\s+{_CRON_SECRET_VAR_RE})'
+    rf'(?={_CRON_CURL_INVOCATION}https?://api\.github\.com(?:/|\b))'
+    rf'{_CRON_CURL_INVOCATION}',
+    # Vikunja skill: Bearer tokens going to the user's own Vikunja instance,
+    # identified by a literal $VIKUNJA_URL reference within the same curl
+    # invocation — destination is bound to whatever the user's env has set.
+    rf'curl(?={_CRON_CURL_INVOCATION}Authorization:\s*Bearer\s+{_CRON_SECRET_VAR_RE})'
+    rf'(?={_CRON_CURL_INVOCATION}\$\{{?VIKUNJA_URL\}}?)'
+    rf'{_CRON_CURL_INVOCATION}',
 ]
 
 _CRON_INVISIBLE_CHARS = {
@@ -71,17 +96,10 @@ _CRON_INVISIBLE_CHARS = {
 
 def _scan_cron_prompt(prompt: str) -> str:
     """Scan a cron prompt for critical threats. Returns error string if blocked, else empty."""
-    github_auth_header = re.search(
-        rf'curl\s+[^\n]*(?:-H|--header)\s+["\']Authorization:\s*token\s+{_CRON_SECRET_VAR_RE}["\']'
-        r'\s+["\']?https://api\.github\.com(?:/|\b)',
-        prompt,
-        re.IGNORECASE,
-    )
     prompt_to_scan = prompt
-    if github_auth_header:
-        # Allow the bundled GitHub skill fallback shape without opening a
-        # blanket exemption for arbitrary Authorization-header exfiltration.
-        prompt_to_scan = prompt.replace(github_auth_header.group(0), "curl https://api.github.com/user")
+    for exemption in _CRON_AUTH_HEADER_EXEMPTIONS:
+        for match in re.finditer(exemption, prompt, re.IGNORECASE):
+            prompt_to_scan = prompt_to_scan.replace(match.group(0), "")
     for char in _CRON_INVISIBLE_CHARS:
         if char in prompt_to_scan:
             return f"Blocked: prompt contains invisible unicode U+{ord(char):04X} (possible injection)."
