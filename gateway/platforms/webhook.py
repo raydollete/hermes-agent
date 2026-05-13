@@ -542,14 +542,47 @@ class WebhookAdapter(BasePlatformAdapter):
         self._delivery_info_created[session_chat_id] = now
         self._prune_delivery_info(now)
 
-        # Build source and event
-        source = self.build_source(
-            chat_id=session_chat_id,
-            chat_name=f"webhook/{route_name}",
-            chat_type="webhook",
-            user_id=f"webhook:{route_name}",
-            user_name=route_name,
-        )
+        # Build source and event.
+        # For Mattermost slash commands carrying session-critical commands
+        # (approve, deny), build the source as a MATTERMOST origin so the
+        # gateway's session key matches the mattermost session (where pending
+        # approvals live).  For everything else, use the webhook identity.
+        mm_channel = payload.get("channel_id", "")
+        mm_user = payload.get("user_name", route_name)
+        if mm_channel and route_name in ("approve", "deny"):
+            mm_adapter = self.gateway_runner.adapters.get(Platform.MATTERMOST)
+            if mm_adapter:
+                # Resolve the actual chat_type ("dm", "channel", "group") so the
+                # session key matches the pending approval.  Hardcoding
+                # chat_type="mattermost" produces a different session key and
+                # the approval lookup silently fails.
+                mm_chat_info = await mm_adapter.get_chat_info(mm_channel)
+                mm_chat_type = mm_chat_info.get("type", "channel")
+                mm_chat_name = mm_chat_info.get("name", payload.get("channel_name", ""))
+                source = mm_adapter.build_source(
+                    chat_id=mm_channel,
+                    chat_name=mm_chat_name,
+                    chat_type=mm_chat_type,
+                    user_id=payload.get("user_id", mm_user),
+                    user_name=mm_user,
+                )
+                session_chat_id = mm_channel  # use raw channel for delivery key too
+            else:
+                source = self.build_source(
+                    chat_id=session_chat_id,
+                    chat_name=f"webhook/{route_name}",
+                    chat_type="webhook",
+                    user_id=f"webhook:{route_name}",
+                    user_name=route_name,
+                )
+        else:
+            source = self.build_source(
+                chat_id=session_chat_id,
+                chat_name=f"webhook/{route_name}",
+                chat_type="webhook",
+                user_id=f"webhook:{route_name}",
+                user_name=route_name,
+            )
         event = MessageEvent(
             text=prompt,
             message_type=MessageType.TEXT,
@@ -567,10 +600,32 @@ class WebhookAdapter(BasePlatformAdapter):
             delivery_id,
         )
 
-        # Non-blocking — return 202 Accepted immediately
+        # Non-blocking — dispatch agent task
         task = asyncio.create_task(self.handle_message(event))
         self._background_tasks.add(task)
         task.add_done_callback(self._background_tasks.discard)
+
+        # Detect Mattermost slash commands and return 200 OK to dismiss them.
+        # Mattermost expects 200 OK from slash command POST handlers — 202 triggers
+        # 'Error Executing Command' in the UI on iOS and all clients.
+        response_url = payload.get("response_url", "")
+        if response_url:
+            logger.debug(
+                "[webhook] Mattermost slash command detected for route %s, acking via response_url",
+                route_name,
+            )
+            # Post ephemeral "Working..." to the user via response_url so they
+            # get immediate feedback before the async agent task completes.
+            self._send_response_url_ack(response_url, route_name)
+            return web.json_response(
+                {
+                    "status": "accepted",
+                    "route": route_name,
+                    "event": event_type,
+                    "delivery_id": delivery_id,
+                },
+                status=200,
+            )
 
         return web.json_response(
             {
@@ -652,9 +707,11 @@ class WebhookAdapter(BasePlatformAdapter):
             value: Any = payload
             for part in key.split("."):
                 if isinstance(value, dict):
-                    value = value.get(part, f"{{{key}}}")
+                    if part not in value:
+                        return ""
+                    value = value[part]
                 else:
-                    return f"{{{key}}}"
+                    return ""
             if isinstance(value, (dict, list)):
                 return json.dumps(value, indent=2)[:2000]
             return str(value)
@@ -803,3 +860,56 @@ class WebhookAdapter(BasePlatformAdapter):
             metadata = {"thread_id": thread_id}
 
         return await adapter.send(chat_id, content, metadata=metadata)
+
+    def _send_response_url_ack(self, response_url: str, route_name: str) -> None:
+        """Send an ephemeral 'Working...' message via a Mattermost response_url.
+
+        Mattermost Custom Slash Commands provide a response_url that accepts
+        a JSON payload with a 'text' field. POST within 3 seconds or Mattermost
+        shows 'Error Executing Command'. We keep a bounded aiohttp session per
+        adapter instance to avoid latency from TCP/TLS handshakes.
+
+        This is fire-and-forget — failures are logged but don't block the caller.
+        """
+        try:
+            try:
+                import aiohttp as _aiohttp
+
+                if not hasattr(self, "_response_session") or self._response_session.closed:
+                    self._response_session = _aiohttp.ClientSession(
+                        timeout=_aiohttp.ClientTimeout(total=3)
+                    )
+                session = self._response_session  # type: ignore[union-attr]
+            except (ImportError, AttributeError):
+                session = None
+
+            # If we have an async session, spin up a task for fire-and-forget.
+            # Fallback: no session means skip.
+            if session:
+
+                async def _do_post() -> None:
+                    nonlocal session  # type: ignore[py.unreachable]
+                    try:
+                        async with session.post(
+                            response_url,
+                            json={"text": f"Processing /{route_name}..."},
+                        ) as resp:
+                            resp.raise_for_status()
+                    except Exception as e:
+                        logger.warning(
+                            "[webhook] Failed to ack response_url for route %s: %s",
+                            route_name,
+                            e,
+                        )
+                    finally:
+                        try:
+                            await session.close()
+                            self._response_session = None
+                        except Exception:
+                            pass
+
+                asyncio.ensure_future(_do_post())
+            else:
+                logger.debug("[webhook] No aiohttp session for response_url ack (route %s)", route_name)
+        except Exception as e:
+            logger.warning("[webhook] response_url ack failed for route %s: %s", route_name, e)
